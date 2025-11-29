@@ -5,21 +5,29 @@ import { getContractReadOnly, getContractWithSigner } from "./components/useCont
 import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
+import { ethers } from 'ethers';
 
 interface ModelData {
   id: string;
   name: string;
   encryptedValue: string;
-  publicValue1: number;
-  publicValue2: number;
-  description: string;
-  creator: string;
+  accuracy: number;
+  price: number;
   timestamp: number;
+  creator: string;
   isVerified: boolean;
   decryptedValue: number;
   category: string;
-  price: number;
-  accuracy: number;
+  downloads: number;
+  rating: number;
+}
+
+interface UserHistory {
+  id: string;
+  action: string;
+  modelName: string;
+  timestamp: number;
+  status: string;
 }
 
 const App: React.FC = () => {
@@ -27,35 +35,43 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [models, setModels] = useState<ModelData[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [creatingModel, setCreatingModel] = useState(false);
-  const [transactionStatus, setTransactionStatus] = useState<{ visible: boolean; status: "pending" | "success" | "error"; message: string; }>({ 
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadingModel, setUploadingModel] = useState(false);
+  const [transactionStatus, setTransactionStatus] = useState({ 
     visible: false, 
     status: "pending", 
     message: "" 
   });
   const [newModelData, setNewModelData] = useState({ 
     name: "", 
-    value: "", 
-    description: "",
-    category: "AI",
-    price: "0",
-    accuracy: "95"
+    accuracy: "", 
+    price: "", 
+    category: "AI" 
   });
   const [selectedModel, setSelectedModel] = useState<ModelData | null>(null);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [selectedCategory, setSelectedCategory] = useState("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeCategory, setActiveCategory] = useState("All");
+  const [userHistory, setUserHistory] = useState<UserHistory[]>([]);
   const [showFAQ, setShowFAQ] = useState(false);
-  const [stats, setStats] = useState({ total: 0, verified: 0, avgPrice: 0 });
+  const [stats, setStats] = useState({
+    totalModels: 0,
+    verifiedModels: 0,
+    totalDownloads: 0,
+    avgRating: 0
+  });
 
   const { status, initialize, isInitialized } = useFhevm();
   const { encrypt, isEncrypting } = useEncrypt();
   const { verifyDecryption, isDecrypting: fheIsDecrypting } = useDecrypt();
+  const [fhevmInitializing, setFhevmInitializing] = useState(false);
+  const [contractAddress, setContractAddress] = useState("");
 
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
-      if (!isConnected || isInitialized) return;
+      if (!isConnected || isInitialized || fhevmInitializing) return;
+      
       try {
+        setFhevmInitializing(true);
         await initialize();
       } catch (error) {
         setTransactionStatus({ 
@@ -64,11 +80,13 @@ const App: React.FC = () => {
           message: "FHEVM initialization failed" 
         });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
+      } finally {
+        setFhevmInitializing(false);
       }
     };
 
     initFhevmAfterConnection();
-  }, [isConnected, isInitialized, initialize]);
+  }, [isConnected, isInitialized, initialize, fhevmInitializing]);
 
   useEffect(() => {
     const loadDataAndContract = async () => {
@@ -78,7 +96,9 @@ const App: React.FC = () => {
       }
       
       try {
-        await loadData();
+        await loadModels();
+        const contract = await getContractReadOnly();
+        if (contract) setContractAddress(await contract.getAddress());
       } catch (error) {
         console.error('Failed to load data:', error);
       } finally {
@@ -89,7 +109,7 @@ const App: React.FC = () => {
     loadDataAndContract();
   }, [isConnected]);
 
-  const loadData = async () => {
+  const loadModels = async () => {
     if (!isConnected) return;
     
     setIsRefreshing(true);
@@ -99,65 +119,94 @@ const App: React.FC = () => {
       
       const businessIds = await contract.getAllBusinessIds();
       const modelsList: ModelData[] = [];
+      let totalDownloads = 0;
+      let totalRating = 0;
       
       for (const businessId of businessIds) {
         try {
           const businessData = await contract.getBusinessData(businessId);
+          const downloads = Number(businessData.publicValue1) || 0;
+          const rating = Number(businessData.publicValue2) || 0;
+          
+          totalDownloads += downloads;
+          totalRating += rating;
+          
           modelsList.push({
             id: businessId,
             name: businessData.name,
             encryptedValue: businessId,
-            publicValue1: Number(businessData.publicValue1) || 0,
-            publicValue2: Number(businessData.publicValue2) || 0,
-            description: businessData.description,
-            creator: businessData.creator,
+            accuracy: rating,
+            price: downloads,
             timestamp: Number(businessData.timestamp),
+            creator: businessData.creator,
             isVerified: businessData.isVerified,
             decryptedValue: Number(businessData.decryptedValue) || 0,
             category: "AI",
-            price: Number(businessData.publicValue1) || 0,
-            accuracy: Number(businessData.publicValue2) || 95
+            downloads: downloads,
+            rating: rating
           });
         } catch (e) {
-          console.error('Error loading business data:', e);
+          console.error('Error loading model data:', e);
         }
       }
       
       setModels(modelsList);
-      updateStats(modelsList);
+      setStats({
+        totalModels: modelsList.length,
+        verifiedModels: modelsList.filter(m => m.isVerified).length,
+        totalDownloads,
+        avgRating: modelsList.length > 0 ? totalRating / modelsList.length : 0
+      });
+      
+      if (address) {
+        loadUserHistory();
+      }
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
+      setTransactionStatus({ visible: true, status: "error", message: "Failed to load models" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
       setIsRefreshing(false); 
     }
   };
 
-  const updateStats = (modelsList: ModelData[]) => {
-    const total = modelsList.length;
-    const verified = modelsList.filter(m => m.isVerified).length;
-    const avgPrice = total > 0 ? modelsList.reduce((sum, m) => sum + m.price, 0) / total : 0;
-    setStats({ total, verified, avgPrice });
+  const loadUserHistory = async () => {
+    const mockHistory: UserHistory[] = [
+      {
+        id: "1",
+        action: "Download",
+        modelName: "Neural Network Pro",
+        timestamp: Date.now() - 86400000,
+        status: "Completed"
+      },
+      {
+        id: "2",
+        action: "Upload",
+        modelName: "Vision Transformer",
+        timestamp: Date.now() - 172800000,
+        status: "Verified"
+      }
+    ];
+    setUserHistory(mockHistory);
   };
 
-  const createModel = async () => {
+  const uploadModel = async () => {
     if (!isConnected || !address) { 
       setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return; 
     }
     
-    setCreatingModel(true);
-    setTransactionStatus({ visible: true, status: "pending", message: "Creating model with Zama FHE..." });
+    setUploadingModel(true);
+    setTransactionStatus({ visible: true, status: "pending", message: "Encrypting model with Zama FHE..." });
     
     try {
       const contract = await getContractWithSigner();
       if (!contract) throw new Error("Failed to get contract with signer");
       
-      const modelValue = parseInt(newModelData.value) || 0;
+      const modelValue = parseInt(newModelData.accuracy) || 0;
       const businessId = `model-${Date.now()}`;
       
-      const encryptedResult = await encrypt(await contract.getAddress(), address, modelValue);
+      const encryptedResult = await encrypt(contractAddress, address, modelValue);
       
       const tx = await contract.createBusinessData(
         businessId,
@@ -165,33 +214,35 @@ const App: React.FC = () => {
         encryptedResult.encryptedData,
         encryptedResult.proof,
         parseInt(newModelData.price) || 0,
-        parseInt(newModelData.accuracy) || 95,
-        newModelData.description
+        parseInt(newModelData.accuracy) || 0,
+        `AI Model: ${newModelData.category}`
       );
       
       setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
       await tx.wait();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Model created successfully!" });
+      addToHistory("Upload", newModelData.name, "Pending");
+      
+      setTransactionStatus({ visible: true, status: "success", message: "Model uploaded successfully!" });
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
       
-      await loadData();
-      setShowCreateModal(false);
-      setNewModelData({ name: "", value: "", description: "", category: "AI", price: "0", accuracy: "95" });
+      await loadModels();
+      setShowUploadModal(false);
+      setNewModelData({ name: "", accuracy: "", price: "", category: "AI" });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
-        ? "Transaction rejected by user" 
-        : "Submission failed: " + (e.message || "Unknown error");
+        ? "Transaction rejected" 
+        : "Upload failed: " + (e.message || "Unknown error");
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
-      setCreatingModel(false); 
+      setUploadingModel(false); 
     }
   };
 
-  const decryptData = async (businessId: string): Promise<number | null> => {
+  const decryptModel = async (modelId: string): Promise<number | null> => {
     if (!isConnected || !address) { 
       setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -202,39 +253,34 @@ const App: React.FC = () => {
       const contractRead = await getContractReadOnly();
       if (!contractRead) return null;
       
-      const businessData = await contractRead.getBusinessData(businessId);
-      if (businessData.isVerified) {
-        const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ 
-          visible: true, 
-          status: "success", 
-          message: "Data already verified on-chain" 
-        });
-        setTimeout(() => {
-          setTransactionStatus({ visible: false, status: "pending", message: "" });
-        }, 2000);
+      const modelData = await contractRead.getBusinessData(modelId);
+      if (modelData.isVerified) {
+        const storedValue = Number(modelData.decryptedValue) || 0;
+        setTransactionStatus({ visible: true, status: "success", message: "Model already verified" });
+        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
         return storedValue;
       }
       
       const contractWrite = await getContractWithSigner();
       if (!contractWrite) return null;
       
-      const encryptedValueHandle = await contractRead.getEncryptedValue(businessId);
+      const encryptedValueHandle = await contractRead.getEncryptedValue(modelId);
       
       const result = await verifyDecryption(
         [encryptedValueHandle],
-        await contractRead.getAddress(),
+        contractAddress,
         (abiEncodedClearValues: string, decryptionProof: string) => 
-          contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
+          contractWrite.verifyDecryption(modelId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption on-chain..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption..." });
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
-      await loadData();
+      await loadModels();
+      addToHistory("Download", modelId, "Decrypted");
       
-      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted and verified successfully!" });
+      setTransactionStatus({ visible: true, status: "success", message: "Model decrypted successfully!" });
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
@@ -243,43 +289,37 @@ const App: React.FC = () => {
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ 
-          visible: true, 
-          status: "success", 
-          message: "Data is already verified on-chain" 
-        });
-        setTimeout(() => {
-          setTransactionStatus({ visible: false, status: "pending", message: "" });
-        }, 2000);
-        
-        await loadData();
+        setTransactionStatus({ visible: true, status: "success", message: "Model already verified" });
+        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        await loadModels();
         return null;
       }
       
-      setTransactionStatus({ 
-        visible: true, 
-        status: "error", 
-        message: "Decryption failed: " + (e.message || "Unknown error") 
-      });
+      setTransactionStatus({ visible: true, status: "error", message: "Decryption failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
     }
   };
 
+  const addToHistory = (action: string, modelName: string, status: string) => {
+    const newHistory: UserHistory = {
+      id: Date.now().toString(),
+      action,
+      modelName,
+      timestamp: Date.now(),
+      status
+    };
+    setUserHistory(prev => [newHistory, ...prev.slice(0, 9)]);
+  };
+
   const checkAvailability = async () => {
     try {
       const contract = await getContractReadOnly();
-      if (!contract) return;
-      
-      const isAvailable = await contract.isAvailable();
-      setTransactionStatus({ 
-        visible: true, 
-        status: "success", 
-        message: `Contract is available: ${isAvailable}` 
-      });
-      setTimeout(() => {
-        setTransactionStatus({ visible: false, status: "pending", message: "" });
-      }, 2000);
+      if (contract) {
+        const available = await contract.isAvailable();
+        setTransactionStatus({ visible: true, status: "success", message: "Contract is available!" });
+        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+      }
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Availability check failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -287,45 +327,32 @@ const App: React.FC = () => {
   };
 
   const filteredModels = models.filter(model => {
-    const matchesSearch = model.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                         model.description.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchesCategory = selectedCategory === "all" || model.category === selectedCategory;
+    const matchesSearch = model.name.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesCategory = activeCategory === "All" || model.category === activeCategory;
     return matchesSearch && matchesCategory;
   });
 
-  const categories = ["all", "AI", "ML", "NLP", "CV", "Audio"];
+  const categories = ["All", "AI", "ML", "Neural Network", "Vision", "NLP"];
 
   if (!isConnected) {
     return (
       <div className="app-container">
         <header className="app-header">
-          <div className="logo">
-            <h1>ModelMart FHE 🔐</h1>
-            <p>AI Model Privacy Marketplace</p>
+          <div className="logo-section">
+            <div className="logo-icon">🔮</div>
+            <h1>ModelMart FHE</h1>
           </div>
-          <div className="header-actions">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
-          </div>
+          <ConnectButton />
         </header>
         
-        <div className="connection-prompt">
-          <div className="connection-content">
-            <div className="connection-icon">🤖</div>
-            <h2>Connect Your Wallet to Access Encrypted AI Models</h2>
-            <p>Experience secure AI model trading with fully homomorphic encryption technology</p>
-            <div className="connection-steps">
-              <div className="step">
-                <span>1</span>
-                <p>Connect your wallet to initialize FHE system</p>
-              </div>
-              <div className="step">
-                <span>2</span>
-                <p>Browse encrypted AI models securely</p>
-              </div>
-              <div className="step">
-                <span>3</span>
-                <p>Trade models with complete privacy protection</p>
-              </div>
+        <div className="hero-section">
+          <div className="hero-content">
+            <h2>FHE-based AI Model Marketplace</h2>
+            <p>Buyers upload encrypted data, sellers provide encrypted models, homomorphic inference delivers results</p>
+            <div className="hero-features">
+              <div className="feature">🔐 Dual Encryption</div>
+              <div className="feature">🤖 Homomorphic Inference</div>
+              <div className="feature">🛡️ IP Protection</div>
             </div>
           </div>
         </div>
@@ -333,19 +360,18 @@ const App: React.FC = () => {
     );
   }
 
-  if (!isInitialized) {
+  if (!isInitialized || fhevmInitializing) {
     return (
       <div className="loading-screen">
-        <div className="fhe-spinner"></div>
+        <div className="neon-spinner"></div>
         <p>Initializing FHE Encryption System...</p>
-        <p className="loading-note">Securing your AI model transactions</p>
       </div>
     );
   }
 
   if (loading) return (
     <div className="loading-screen">
-      <div className="fhe-spinner"></div>
+      <div className="neon-spinner"></div>
       <p>Loading encrypted marketplace...</p>
     </div>
   );
@@ -353,359 +379,243 @@ const App: React.FC = () => {
   return (
     <div className="app-container">
       <header className="app-header">
-        <div className="logo">
-          <h1>ModelMart FHE 🔐</h1>
-          <p>Secure AI Model Marketplace</p>
-        </div>
-        
-        <div className="header-actions">
-          <button onClick={checkAvailability} className="availability-btn">
-            Check Availability
-          </button>
-          <button onClick={() => setShowCreateModal(true)} className="create-btn">
-            + List Model
-          </button>
-          <button onClick={() => setShowFAQ(!showFAQ)} className="faq-btn">
-            FAQ
-          </button>
-          <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
-        </div>
-      </header>
-
-      {showFAQ && (
-        <div className="faq-modal">
-          <div className="faq-content">
-            <h3>FHE AI Marketplace FAQ</h3>
-            <div className="faq-item">
-              <strong>What is FHE?</strong>
-              <p>Fully Homomorphic Encryption allows computation on encrypted data without decryption.</p>
-            </div>
-            <div className="faq-item">
-              <strong>How are models protected?</strong>
-              <p>Models and data remain encrypted during inference using Zama FHE technology.</p>
-            </div>
-            <div className="faq-item">
-              <strong>What data types are supported?</strong>
-              <p>Currently supports integer values for FHE operations.</p>
-            </div>
-            <button onClick={() => setShowFAQ(false)} className="close-faq">Close</button>
+        <div className="header-main">
+          <div className="logo-section">
+            <div className="logo-icon">🔮</div>
+            <h1>ModelMart FHE</h1>
+          </div>
+          
+          <div className="header-actions">
+            <button className="nav-btn" onClick={checkAvailability}>
+              Check Availability
+            </button>
+            <button className="nav-btn" onClick={() => setShowFAQ(!showFAQ)}>
+              FAQ
+            </button>
+            <button className="upload-btn" onClick={() => setShowUploadModal(true)}>
+              Upload Model
+            </button>
+            <ConnectButton />
           </div>
         </div>
-      )}
-      
+        
+        <nav className="category-nav">
+          {categories.map(category => (
+            <button
+              key={category}
+              className={`category-btn ${activeCategory === category ? 'active' : ''}`}
+              onClick={() => setActiveCategory(category)}
+            >
+              {category}
+            </button>
+          ))}
+        </nav>
+      </header>
+
       <div className="main-content">
         <div className="stats-panel">
           <div className="stat-card">
-            <h3>Total Models</h3>
-            <div className="stat-value">{stats.total}</div>
+            <div className="stat-value">{stats.totalModels}</div>
+            <div className="stat-label">AI Models</div>
           </div>
           <div className="stat-card">
-            <h3>Verified</h3>
-            <div className="stat-value">{stats.verified}</div>
+            <div className="stat-value">{stats.verifiedModels}</div>
+            <div className="stat-label">Verified</div>
           </div>
           <div className="stat-card">
-            <h3>Avg Price</h3>
-            <div className="stat-value">{stats.avgPrice.toFixed(1)} ETH</div>
+            <div className="stat-value">{stats.totalDownloads}</div>
+            <div className="stat-label">Downloads</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{stats.avgRating.toFixed(1)}</div>
+            <div className="stat-label">Avg Rating</div>
           </div>
         </div>
 
         <div className="search-section">
-          <div className="search-bar">
-            <input 
-              type="text" 
-              placeholder="Search models..." 
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+          <div className="search-box">
+            <input
+              type="text"
+              placeholder="Search AI models..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="search-input"
             />
-            <select 
-              value={selectedCategory} 
-              onChange={(e) => setSelectedCategory(e.target.value)}
-            >
-              {categories.map(cat => (
-                <option key={cat} value={cat}>{cat === "all" ? "All Categories" : cat}</option>
-              ))}
-            </select>
-            <button onClick={loadData} disabled={isRefreshing}>
-              {isRefreshing ? "Refreshing..." : "Refresh"}
-            </button>
+            <button className="search-btn">🔍</button>
           </div>
-        </div>
-
-        <div className="models-grid">
-          {filteredModels.length === 0 ? (
-            <div className="no-models">
-              <p>No AI models found</p>
-              <button onClick={() => setShowCreateModal(true)} className="create-btn">
-                List First Model
-              </button>
-            </div>
-          ) : (
-            filteredModels.map((model, index) => (
-              <div 
-                className={`model-card ${model.isVerified ? "verified" : ""}`}
-                key={index}
-                onClick={() => setSelectedModel(model)}
-              >
-                <div className="model-header">
-                  <h3>{model.name}</h3>
-                  <span className="price">{model.price} ETH</span>
-                </div>
-                <div className="model-meta">
-                  <span>Accuracy: {model.accuracy}%</span>
-                  <span>Category: {model.category}</span>
-                </div>
-                <p className="model-desc">{model.description}</p>
-                <div className="model-status">
-                  {model.isVerified ? "✅ Verified" : "🔒 Encrypted"}
-                </div>
-                <div className="model-creator">
-                  Creator: {model.creator.substring(0, 6)}...{model.creator.substring(38)}
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-      
-      {showCreateModal && (
-        <ModalCreateModel 
-          onSubmit={createModel} 
-          onClose={() => setShowCreateModal(false)} 
-          creating={creatingModel} 
-          modelData={newModelData} 
-          setModelData={setNewModelData}
-          isEncrypting={isEncrypting}
-        />
-      )}
-      
-      {selectedModel && (
-        <ModelDetailModal 
-          model={selectedModel} 
-          onClose={() => setSelectedModel(null)} 
-          isDecrypting={fheIsDecrypting} 
-          decryptData={() => decryptData(selectedModel.id)}
-        />
-      )}
-      
-      {transactionStatus.visible && (
-        <div className="transaction-modal">
-          <div className="transaction-content">
-            <div className={`transaction-icon ${transactionStatus.status}`}>
-              {transactionStatus.status === "pending" && <div className="fhe-spinner"></div>}
-              {transactionStatus.status === "success" && "✓"}
-              {transactionStatus.status === "error" && "✗"}
-            </div>
-            <div className="transaction-message">{transactionStatus.message}</div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const ModalCreateModel: React.FC<{
-  onSubmit: () => void; 
-  onClose: () => void; 
-  creating: boolean;
-  modelData: any;
-  setModelData: (data: any) => void;
-  isEncrypting: boolean;
-}> = ({ onSubmit, onClose, creating, modelData, setModelData, isEncrypting }) => {
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
-    const { name, value } = e.target;
-    if (name === 'value' || name === 'price' || name === 'accuracy') {
-      const intValue = value.replace(/[^\d]/g, '');
-      setModelData({ ...modelData, [name]: intValue });
-    } else {
-      setModelData({ ...modelData, [name]: value });
-    }
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="create-model-modal">
-        <div className="modal-header">
-          <h2>List New AI Model</h2>
-          <button onClick={onClose} className="close-modal">&times;</button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="fhe-notice">
-            <strong>FHE 🔐 Protection</strong>
-            <p>Model parameters will be encrypted with Zama FHE technology</p>
-          </div>
-          
-          <div className="form-group">
-            <label>Model Name *</label>
-            <input 
-              type="text" 
-              name="name" 
-              value={modelData.name} 
-              onChange={handleChange} 
-              placeholder="Enter model name..." 
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Model Parameter (Integer) *</label>
-            <input 
-              type="number" 
-              name="value" 
-              value={modelData.value} 
-              onChange={handleChange} 
-              placeholder="Enter parameter value..." 
-              step="1"
-              min="0"
-            />
-            <div className="data-type-label">FHE Encrypted Integer</div>
-          </div>
-          
-          <div className="form-group">
-            <label>Price (ETH) *</label>
-            <input 
-              type="number" 
-              name="price" 
-              value={modelData.price} 
-              onChange={handleChange} 
-              placeholder="Enter price in ETH..." 
-              min="0"
-              step="0.1"
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Accuracy (%) *</label>
-            <input 
-              type="number" 
-              name="accuracy" 
-              value={modelData.accuracy} 
-              onChange={handleChange} 
-              placeholder="Enter accuracy percentage..." 
-              min="0"
-              max="100"
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>Description</label>
-            <textarea 
-              name="description" 
-              value={modelData.description} 
-              onChange={handleChange} 
-              placeholder="Describe your AI model..." 
-              rows={3}
-            />
-          </div>
-        </div>
-        
-        <div className="modal-footer">
-          <button onClick={onClose} className="cancel-btn">Cancel</button>
-          <button 
-            onClick={onSubmit} 
-            disabled={creating || isEncrypting || !modelData.name || !modelData.value} 
-            className="submit-btn"
-          >
-            {creating || isEncrypting ? "Encrypting and Listing..." : "List Model"}
+          <button onClick={loadModels} className="refresh-btn">
+            {isRefreshing ? "🔄" : "Refresh"}
           </button>
         </div>
-      </div>
-    </div>
-  );
-};
 
-const ModelDetailModal: React.FC<{
-  model: ModelData;
-  onClose: () => void;
-  isDecrypting: boolean;
-  decryptData: () => Promise<number | null>;
-}> = ({ model, onClose, isDecrypting, decryptData }) => {
-  const [decryptedValue, setDecryptedValue] = useState<number | null>(null);
-
-  const handleDecrypt = async () => {
-    const value = await decryptData();
-    setDecryptedValue(value);
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="model-detail-modal">
-        <div className="modal-header">
-          <h2>Model Details</h2>
-          <button onClick={onClose} className="close-modal">&times;</button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="model-info">
-            <div className="info-row">
-              <span>Name:</span>
-              <strong>{model.name}</strong>
-            </div>
-            <div className="info-row">
-              <span>Price:</span>
-              <strong>{model.price} ETH</strong>
-            </div>
-            <div className="info-row">
-              <span>Accuracy:</span>
-              <strong>{model.accuracy}%</strong>
-            </div>
-            <div className="info-row">
-              <span>Creator:</span>
-              <strong>{model.creator.substring(0, 6)}...{model.creator.substring(38)}</strong>
-            </div>
-            <div className="info-row">
-              <span>Listed:</span>
-              <strong>{new Date(model.timestamp * 1000).toLocaleDateString()}</strong>
+        <div className="content-grid">
+          <div className="models-section">
+            <h2>Available AI Models</h2>
+            <div className="models-grid">
+              {filteredModels.length === 0 ? (
+                <div className="empty-state">
+                  <p>No models found</p>
+                  <button onClick={() => setShowUploadModal(true)} className="upload-btn">
+                    Upload First Model
+                  </button>
+                </div>
+              ) : (
+                filteredModels.map((model) => (
+                  <div key={model.id} className="model-card">
+                    <div className="model-header">
+                      <h3>{model.name}</h3>
+                      <span className={`status ${model.isVerified ? 'verified' : 'encrypted'}`}>
+                        {model.isVerified ? '✅' : '🔒'}
+                      </span>
+                    </div>
+                    <div className="model-meta">
+                      <span>Accuracy: {model.accuracy}%</span>
+                      <span>Price: {model.price} FHE</span>
+                    </div>
+                    <div className="model-stats">
+                      <span>Downloads: {model.downloads}</span>
+                      <span>Rating: {model.rating}/5</span>
+                    </div>
+                    <button 
+                      onClick={() => decryptModel(model.id)}
+                      className={`download-btn ${model.isVerified ? 'verified' : ''}`}
+                    >
+                      {model.isVerified ? 'Download Decrypted' : 'Decrypt & Download'}
+                    </button>
+                  </div>
+                ))
+              )}
             </div>
           </div>
-          
-          <div className="data-section">
-            <h3>Encrypted Model Data</h3>
-            
-            <div className="data-row">
-              <div className="data-label">Model Parameter:</div>
-              <div className="data-value">
-                {model.isVerified ? 
-                  `${model.decryptedValue} (On-chain Verified)` : 
-                  decryptedValue !== null ? 
-                  `${decryptedValue} (Locally Decrypted)` : 
-                  "🔒 FHE Encrypted"
-                }
+
+          <div className="sidebar">
+            <div className="history-panel">
+              <h3>Your Activity</h3>
+              <div className="history-list">
+                {userHistory.map(record => (
+                  <div key={record.id} className="history-item">
+                    <div className="history-action">{record.action}</div>
+                    <div className="history-model">{record.modelName}</div>
+                    <div className="history-status">{record.status}</div>
+                    <div className="history-time">
+                      {new Date(record.timestamp).toLocaleDateString()}
+                    </div>
+                  </div>
+                ))}
               </div>
-              <button 
-                className={`decrypt-btn ${(model.isVerified || decryptedValue !== null) ? 'decrypted' : ''}`}
-                onClick={handleDecrypt} 
-                disabled={isDecrypting}
-              >
-                {isDecrypting ? "Decrypting..." : 
-                 model.isVerified ? "✅ Verified" : 
-                 decryptedValue !== null ? "🔄 Re-verify" : "🔓 Decrypt"}
+            </div>
+
+            <div className="info-panel">
+              <h3>FHE Process</h3>
+              <div className="process-step">
+                <span>1</span>
+                <p>Encrypt model with Zama FHE</p>
+              </div>
+              <div className="process-step">
+                <span>2</span>
+                <p>Store encrypted data on-chain</p>
+              </div>
+              <div className="process-step">
+                <span>3</span>
+                <p>Homomorphic inference processing</p>
+              </div>
+              <div className="process-step">
+                <span>4</span>
+                <p>Secure result delivery</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {showFAQ && (
+          <div className="faq-panel">
+            <h3>Frequently Asked Questions</h3>
+            <div className="faq-item">
+              <h4>What is FHE encryption?</h4>
+              <p>Fully Homomorphic Encryption allows computation on encrypted data without decryption.</p>
+            </div>
+            <div className="faq-item">
+              <h4>How are models protected?</h4>
+              <p>Both data and models remain encrypted during entire inference process.</p>
+            </div>
+            <div className="faq-item">
+              <h4>What data types are supported?</h4>
+              <p>Currently supports integer numbers for FHE operations.</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {showUploadModal && (
+        <div className="modal-overlay">
+          <div className="upload-modal">
+            <div className="modal-header">
+              <h2>Upload AI Model</h2>
+              <button onClick={() => setShowUploadModal(false)} className="close-btn">×</button>
+            </div>
+            <div className="modal-body">
+              <div className="form-group">
+                <label>Model Name</label>
+                <input
+                  type="text"
+                  value={newModelData.name}
+                  onChange={(e) => setNewModelData({...newModelData, name: e.target.value})}
+                  placeholder="Enter model name"
+                />
+              </div>
+              <div className="form-group">
+                <label>Accuracy Score (FHE Encrypted)</label>
+                <input
+                  type="number"
+                  value={newModelData.accuracy}
+                  onChange={(e) => setNewModelData({...newModelData, accuracy: e.target.value})}
+                  placeholder="Enter accuracy 0-100"
+                />
+              </div>
+              <div className="form-group">
+                <label>Price (Public)</label>
+                <input
+                  type="number"
+                  value={newModelData.price}
+                  onChange={(e) => setNewModelData({...newModelData, price: e.target.value})}
+                  placeholder="Enter price in tokens"
+                />
+              </div>
+              <div className="form-group">
+                <label>Category</label>
+                <select
+                  value={newModelData.category}
+                  onChange={(e) => setNewModelData({...newModelData, category: e.target.value})}
+                >
+                  <option value="AI">AI</option>
+                  <option value="ML">Machine Learning</option>
+                  <option value="Vision">Computer Vision</option>
+                  <option value="NLP">Natural Language</option>
+                </select>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button onClick={() => setShowUploadModal(false)} className="cancel-btn">Cancel</button>
+              <button onClick={uploadModel} disabled={uploadingModel} className="upload-btn">
+                {uploadingModel ? "Encrypting..." : "Upload Model"}
               </button>
             </div>
-            
-            <div className="fhe-info">
-              <div className="fhe-icon">🔐</div>
-              <div>
-                <strong>FHE Protected Inference</strong>
-                <p>Model parameters remain encrypted during computation using homomorphic encryption.</p>
-              </div>
-            </div>
-          </div>
-          
-          <div className="description-section">
-            <h3>Description</h3>
-            <p>{model.description}</p>
           </div>
         </div>
-        
-        <div className="modal-footer">
-          <button onClick={onClose} className="close-btn">Close</button>
-          {!model.isVerified && (
-            <button onClick={handleDecrypt} disabled={isDecrypting} className="verify-btn">
-              Verify on-chain
-            </button>
-          )}
+      )}
+
+      {transactionStatus.visible && (
+        <div className={`transaction-toast ${transactionStatus.status}`}>
+          <div className="toast-content">
+            <span className="toast-icon">
+              {transactionStatus.status === "pending" && "⏳"}
+              {transactionStatus.status === "success" && "✅"}
+              {transactionStatus.status === "error" && "❌"}
+            </span>
+            {transactionStatus.message}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
